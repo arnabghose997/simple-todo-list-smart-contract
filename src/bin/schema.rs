@@ -1,6 +1,6 @@
 use cosmwasm_schema::write_api;
 
-use cw_voting::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
+use cw_to_do_list::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
 
 fn main() {
     write_api! {

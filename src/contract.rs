@@ -1,19 +1,19 @@
-use crate::coin_helpers::validate_sent_sufficient_coin;
-use crate::error::ContractError;
-use crate::msg::{
-    CreatePollResponse, ExecuteMsg, InstantiateMsg, PollResponse, QueryMsg, TokenStakeResponse,
-};
-use crate::state::{Poll, PollStatus, State, Voter, BANK, CONFIG, POLLS};
+#[cfg(not(feature = "library"))]
+use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    attr, coin, entry_point, to_binary, Addr, BankMsg, Binary, Coin, Deps, DepsMut, Env,
-    MessageInfo, Response, StdError, StdResult, Storage, SubMsg, Uint128,
+    to_binary, Binary, Deps, DepsMut, Env, MessageInfo, Order, Response, StdResult,
 };
+use cw2::set_contract_version;
+use cw_storage_plus::Bound;
+use std::ops::Add;
 
-pub const VOTING_TOKEN: &str = "voting_token";
-pub const DEFAULT_END_HEIGHT_BLOCKS: &u64 = &100_800_u64;
-const MIN_STAKE_AMOUNT: u128 = 1;
-const MIN_DESC_LENGTH: u64 = 3;
-const MAX_DESC_LENGTH: u64 = 64;
+use crate::error::ContractError;
+use crate::msg::{EntryResponse, ExecuteMsg, InstantiateMsg, ListResponse, QueryMsg};
+use crate::state::{Config, Entry, Priority, Status, CONFIG, ENTRY_SEQ, LIST};
+
+// version info for migration
+const CONTRACT_NAME: &str = "crates.io:cw-to-do-list";
+const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn instantiate(
@@ -22,441 +22,362 @@ pub fn instantiate(
     info: MessageInfo,
     msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
-    let state = State {
-        denom: msg.denom,
-        owner: info.sender,
-        poll_count: 0,
-        staked_tokens: Uint128::zero(),
+    set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+
+    let owner = msg
+        .owner
+        .and_then(|addr_string| deps.api.addr_validate(addr_string.as_str()).ok())
+        .unwrap_or(info.sender);
+
+    let config = Config {
+        owner: owner.clone(),
     };
+    CONFIG.save(deps.storage, &config)?;
 
-    CONFIG.save(deps.storage, &state)?;
+    ENTRY_SEQ.save(deps.storage, &0u64)?;
 
-    Ok(Response::default())
+    Ok(Response::new()
+        .add_attribute("method", "instantiate")
+        .add_attribute("owner", owner))
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn execute(
     deps: DepsMut,
-    env: Env,
+    _env: Env,
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
     match msg {
-        ExecuteMsg::StakeVotingTokens {} => stake_voting_tokens(deps, env, info),
-        ExecuteMsg::WithdrawVotingTokens { amount } => {
-            withdraw_voting_tokens(deps, env, info, amount)
-        }
-        ExecuteMsg::CastVote {
-            poll_id,
-            vote,
-            weight,
-        } => cast_vote(deps, env, info, poll_id, vote, weight),
-        ExecuteMsg::EndPoll { poll_id } => end_poll(deps, env, info, poll_id),
-        ExecuteMsg::CreatePoll {
-            quorum_percentage,
+        ExecuteMsg::NewEntry {
             description,
-            start_height,
-            end_height,
-        } => create_poll(
-            deps,
-            env,
-            info,
-            quorum_percentage,
+            priority,
+        } => execute_create_new_entry(deps, info, description, priority),
+        ExecuteMsg::UpdateEntry {
+            id,
             description,
-            start_height,
-            end_height,
-        ),
+            status,
+            priority,
+        } => execute_update_entry(deps, info, id, description, status, priority),
+        ExecuteMsg::DeleteEntry { id } => execute_delete_entry(deps, info, id),
     }
 }
 
-pub fn stake_voting_tokens(
+pub fn execute_create_new_entry(
     deps: DepsMut,
-    _env: Env,
     info: MessageInfo,
-) -> Result<Response, ContractError> {
-    let key = info.sender.as_str().as_bytes();
-
-    let mut token_manager = BANK.may_load(deps.storage, key)?.unwrap_or_default();
-
-    let mut state = CONFIG.load(deps.storage)?;
-
-    validate_sent_sufficient_coin(&info.funds, Some(coin(MIN_STAKE_AMOUNT, &state.denom)))?;
-    let funds = info
-        .funds
-        .iter()
-        .find(|coin| coin.denom.eq(&state.denom))
-        .unwrap();
-
-    token_manager.token_balance += funds.amount;
-
-    let staked_tokens = state.staked_tokens.u128() + funds.amount.u128();
-    state.staked_tokens = Uint128::from(staked_tokens);
-    CONFIG.save(deps.storage, &state)?;
-
-    BANK.save(deps.storage, key, &token_manager)?;
-
-    Ok(Response::default())
-}
-
-// Withdraw amount if not staked. By default all funds will be withdrawn.
-pub fn withdraw_voting_tokens(
-    deps: DepsMut,
-    _env: Env,
-    info: MessageInfo,
-    amount: Option<Uint128>,
-) -> Result<Response, ContractError> {
-    let sender_address_raw = info.sender.as_str().as_bytes();
-
-    if let Some(mut token_manager) = BANK.may_load(deps.storage, sender_address_raw)? {
-        let largest_staked = locked_amount(sender_address_raw, deps.storage);
-        let withdraw_amount = amount.unwrap_or(token_manager.token_balance);
-        if largest_staked + withdraw_amount > token_manager.token_balance {
-            let max_amount = token_manager.token_balance.checked_sub(largest_staked)?;
-            Err(ContractError::ExcessiveWithdraw { max_amount })
-        } else {
-            let balance = token_manager.token_balance.checked_sub(withdraw_amount)?;
-            token_manager.token_balance = balance;
-
-            BANK.save(deps.storage, sender_address_raw, &token_manager)?;
-
-            let mut state = CONFIG.load(deps.storage)?;
-            let staked_tokens = state.staked_tokens.checked_sub(withdraw_amount)?;
-            state.staked_tokens = staked_tokens;
-            CONFIG.save(deps.storage, &state)?;
-
-            Ok(send_tokens(
-                &info.sender,
-                vec![coin(withdraw_amount.u128(), &state.denom)],
-                "approve",
-            ))
-        }
-    } else {
-        Err(ContractError::PollNoStake {})
-    }
-}
-
-/// validate_description returns an error if the description is invalid
-fn validate_description(description: &str) -> Result<(), ContractError> {
-    if (description.len() as u64) < MIN_DESC_LENGTH {
-        Err(ContractError::DescriptionTooShort {
-            min_desc_length: MIN_DESC_LENGTH,
-        })
-    } else if (description.len() as u64) > MAX_DESC_LENGTH {
-        Err(ContractError::DescriptionTooLong {
-            max_desc_length: MAX_DESC_LENGTH,
-        })
-    } else {
-        Ok(())
-    }
-}
-
-/// validate_quorum_percentage returns an error if the quorum_percentage is invalid
-/// (we require 0-100)
-fn validate_quorum_percentage(quorum_percentage: Option<u8>) -> Result<(), ContractError> {
-    match quorum_percentage {
-        Some(qp) => {
-            if qp > 100 {
-                return Err(ContractError::PollQuorumPercentageMismatch {
-                    quorum_percentage: qp,
-                });
-            }
-            Ok(())
-        }
-        None => Ok(()),
-    }
-}
-
-/// validate_end_height returns an error if the poll ends in the past
-fn validate_end_height(end_height: Option<u64>, env: Env) -> Result<(), ContractError> {
-    if end_height.is_some() && env.block.height >= end_height.unwrap() {
-        Err(ContractError::PollCannotEndInPast {})
-    } else {
-        Ok(())
-    }
-}
-
-/// create a new poll
-pub fn create_poll(
-    deps: DepsMut,
-    env: Env,
-    info: MessageInfo,
-    quorum_percentage: Option<u8>,
     description: String,
-    start_height: Option<u64>,
-    end_height: Option<u64>,
+    priority: Option<Priority>,
 ) -> Result<Response, ContractError> {
-    validate_quorum_percentage(quorum_percentage)?;
-    validate_end_height(end_height, env.clone())?;
-    validate_description(&description)?;
-
-    let mut state = CONFIG.load(deps.storage)?;
-    let poll_count = state.poll_count;
-    let poll_id = poll_count + 1;
-    state.poll_count = poll_id;
-
-    let new_poll = Poll {
-        creator: info.sender,
-        status: PollStatus::InProgress,
-        quorum_percentage,
-        yes_votes: Uint128::zero(),
-        no_votes: Uint128::zero(),
-        voters: vec![],
-        voter_info: vec![],
-        end_height: end_height.unwrap_or(env.block.height + DEFAULT_END_HEIGHT_BLOCKS),
-        start_height,
+    let owner = CONFIG.load(deps.storage)?.owner;
+    if info.sender != owner {
+        return Err(ContractError::Unauthorized {});
+    }
+    let id = ENTRY_SEQ.update::<_, cosmwasm_std::StdError>(deps.storage, |id| Ok(id.add(1)))?;
+    let new_entry = Entry {
+        id,
         description,
+        priority: priority.unwrap_or(Priority::None),
+        status: Status::ToDo,
     };
-    let key = state.poll_count.to_be_bytes();
-    POLLS.save(deps.storage, &key, &new_poll)?;
-
-    CONFIG.save(deps.storage, &state)?;
-    let attributes = vec![
-        attr("action", "create_poll"),
-        attr("creator", new_poll.creator),
-        attr("poll_id", &poll_id.to_string()),
-        attr(
-            "quorum_percentage",
-            quorum_percentage.unwrap_or(0).to_string(),
-        ),
-        attr("end_height", new_poll.end_height.to_string()),
-        attr("start_height", start_height.unwrap_or(0).to_string()),
-    ];
-
-    let data = to_binary(&CreatePollResponse { poll_id })?;
-
-    Ok(Response::new().add_attributes(attributes).set_data(data))
+    LIST.save(deps.storage, id, &new_entry)?;
+    Ok(Response::new()
+        .add_attribute("method", "execute_create_new_entry")
+        .add_attribute("new_entry_id", id.to_string()))
 }
 
-/*
- * Ends a poll. Only the creator of a given poll can end that poll.
- */
-pub fn end_poll(
+pub fn execute_update_entry(
     deps: DepsMut,
-    env: Env,
     info: MessageInfo,
-    poll_id: u64,
+    id: u64,
+    description: Option<String>,
+    status: Option<Status>,
+    priority: Option<Priority>,
 ) -> Result<Response, ContractError> {
-    let key = &poll_id.to_be_bytes();
-    let mut a_poll = POLLS.load(deps.storage, key)?;
-
-    if a_poll.creator != info.sender {
-        return Err(ContractError::PollNotCreator {
-            creator: a_poll.creator.to_string(),
-            sender: info.sender.to_string(),
-        });
+    let owner = CONFIG.load(deps.storage)?.owner;
+    if info.sender != owner {
+        return Err(ContractError::Unauthorized {});
     }
 
-    if a_poll.status != PollStatus::InProgress {
-        return Err(ContractError::PollNotInProgress {});
-    }
-
-    if let Some(start_height) = a_poll.start_height {
-        if start_height > env.block.height {
-            return Err(ContractError::PoolVotingPeriodNotStarted { start_height });
-        }
-    }
-
-    if a_poll.end_height > env.block.height {
-        return Err(ContractError::PollVotingPeriodNotExpired {
-            expire_height: a_poll.end_height,
-        });
-    }
-
-    let mut no = 0u128;
-    let mut yes = 0u128;
-
-    for voter in &a_poll.voter_info {
-        if voter.vote == "yes" {
-            yes += voter.weight.u128();
-        } else {
-            no += voter.weight.u128();
-        }
-    }
-    let tallied_weight = yes + no;
-
-    let mut rejected_reason = "";
-    let mut passed = false;
-
-    if tallied_weight > 0 {
-        let state = CONFIG.load(deps.storage)?;
-
-        let staked_weight = deps
-            .querier
-            .query_balance(&env.contract.address, &state.denom)
-            .unwrap()
-            .amount
-            .u128();
-
-        if staked_weight == 0 {
-            return Err(ContractError::PollNoStake {});
-        }
-
-        let quorum = ((tallied_weight / staked_weight) * 100) as u8;
-        if a_poll.quorum_percentage.is_some() && quorum < a_poll.quorum_percentage.unwrap() {
-            // Quorum: More than quorum_percentage of the total staked tokens at the end of the voting
-            // period need to have participated in the vote.
-            rejected_reason = "Quorum not reached";
-        } else if yes > tallied_weight / 2 {
-            //Threshold: More than 50% of the tokens that participated in the vote
-            // (after excluding “Abstain” votes) need to have voted in favor of the proposal (“Yes”).
-            a_poll.status = PollStatus::Passed;
-            passed = true;
-        } else {
-            rejected_reason = "Threshold not reached";
-        }
-    } else {
-        rejected_reason = "Quorum not reached";
-    }
-    if !passed {
-        a_poll.status = PollStatus::Rejected
-    }
-    POLLS.save(deps.storage, key, &a_poll)?;
-
-    for voter in &a_poll.voters {
-        unlock_tokens(deps.storage, voter, poll_id)?;
-    }
-
-    let attributes = vec![
-        attr("action", "end_poll"),
-        attr("poll_id", poll_id.to_string()),
-        attr("rejected_reason", rejected_reason),
-        attr("passed", passed.to_string()),
-    ];
-
-    Ok(Response::new().add_attributes(attributes))
+    let entry = LIST.load(deps.storage, id)?;
+    let updated_entry = Entry {
+        id,
+        description: description.unwrap_or(entry.description),
+        status: status.unwrap_or(entry.status),
+        priority: priority.unwrap_or(entry.priority),
+    };
+    LIST.save(deps.storage, id, &updated_entry)?;
+    Ok(Response::new()
+        .add_attribute("method", "execute_update_entry")
+        .add_attribute("updated_entry_id", id.to_string()))
 }
 
-// unlock voter's tokens in a given poll
-fn unlock_tokens(
-    storage: &mut dyn Storage,
-    voter: &Addr,
-    poll_id: u64,
-) -> Result<Response, ContractError> {
-    let voter_key = voter.as_str().as_bytes();
-    let mut token_manager = BANK.load(storage, voter_key).unwrap();
-
-    // unlock entails removing the mapped poll_id, retaining the rest
-    token_manager.locked_tokens.retain(|(k, _)| k != &poll_id);
-    BANK.save(storage, voter_key, &token_manager)?;
-    Ok(Response::default())
-}
-
-// finds the largest locked amount in participated polls.
-fn locked_amount(voter: &[u8], storage: &dyn Storage) -> Uint128 {
-    let token_manager = BANK.load(storage, voter).unwrap();
-    token_manager
-        .locked_tokens
-        .iter()
-        .map(|(_, v)| *v)
-        .max()
-        .unwrap_or_default()
-}
-
-fn has_voted(voter: &Addr, a_poll: &Poll) -> bool {
-    a_poll.voters.iter().any(|i| i == voter)
-}
-
-pub fn cast_vote(
+pub fn execute_delete_entry(
     deps: DepsMut,
-    _env: Env,
     info: MessageInfo,
-    poll_id: u64,
-    vote: String,
-    weight: Uint128,
+    id: u64,
 ) -> Result<Response, ContractError> {
-    let poll_key = &poll_id.to_be_bytes();
-    let state = CONFIG.load(deps.storage)?;
-    if poll_id == 0 || state.poll_count > poll_id {
-        return Err(ContractError::PollNotExist {});
+    let owner = CONFIG.load(deps.storage)?.owner;
+    if info.sender != owner {
+        return Err(ContractError::Unauthorized {});
     }
 
-    let mut a_poll = POLLS.load(deps.storage, poll_key)?;
-
-    if a_poll.status != PollStatus::InProgress {
-        return Err(ContractError::PollNotInProgress {});
-    }
-
-    if has_voted(&info.sender, &a_poll) {
-        return Err(ContractError::PollSenderVoted {});
-    }
-
-    let key = info.sender.as_str().as_bytes();
-    let mut token_manager = BANK.may_load(deps.storage, key)?.unwrap_or_default();
-
-    if token_manager.token_balance < weight {
-        return Err(ContractError::PollInsufficientStake {});
-    }
-    token_manager.participated_polls.push(poll_id);
-    token_manager.locked_tokens.push((poll_id, weight));
-    BANK.save(deps.storage, key, &token_manager)?;
-
-    a_poll.voters.push(info.sender.clone());
-
-    let voter_info = Voter { vote, weight };
-
-    a_poll.voter_info.push(voter_info);
-    POLLS.save(deps.storage, poll_key, &a_poll)?;
-
-    let attributes = vec![
-        attr("action", "vote_casted"),
-        attr("poll_id", poll_id.to_string()),
-        attr("weight", weight.to_string()),
-        attr("voter", &info.sender),
-    ];
-
-    Ok(Response::new().add_attributes(attributes))
-}
-
-fn send_tokens(to_address: &Addr, amount: Vec<Coin>, action: &str) -> Response {
-    let attributes = vec![attr("action", action), attr("to", to_address.clone())];
-
-    Response::new()
-        .add_submessage(SubMsg::new(BankMsg::Send {
-            to_address: to_address.to_string(),
-            amount,
-        }))
-        .add_attributes(attributes)
+    LIST.remove(deps.storage, id);
+    Ok(Response::new()
+        .add_attribute("method", "execute_delete_entry")
+        .add_attribute("deleted_entry_id", id.to_string()))
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
-        QueryMsg::Config {} => to_binary(&CONFIG.load(deps.storage)?),
-        QueryMsg::TokenStake { address } => {
-            token_balance(deps, deps.api.addr_validate(address.as_str())?)
+        QueryMsg::QueryEntry { id } => to_binary(&query_entry(deps, id)?),
+        QueryMsg::QueryList { start_after, limit } => {
+            to_binary(&query_list(deps, start_after, limit)?)
         }
-        QueryMsg::Poll { poll_id } => query_poll(deps, poll_id),
     }
 }
 
-fn query_poll(deps: Deps, poll_id: u64) -> StdResult<Binary> {
-    let key = &poll_id.to_be_bytes();
-
-    let poll = match POLLS.may_load(deps.storage, key)? {
-        Some(poll) => Some(poll),
-        None => return Err(StdError::generic_err("Poll does not exist")),
-    }
-    .unwrap();
-
-    let resp = PollResponse {
-        creator: poll.creator.to_string(),
-        status: poll.status,
-        quorum_percentage: poll.quorum_percentage,
-        end_height: Some(poll.end_height),
-        start_height: poll.start_height,
-        description: poll.description,
-    };
-    to_binary(&resp)
+fn query_entry(deps: Deps, id: u64) -> StdResult<EntryResponse> {
+    let entry = LIST.load(deps.storage, id)?;
+    Ok(EntryResponse {
+        id: entry.id,
+        description: entry.description,
+        status: entry.status,
+        priority: entry.priority,
+    })
 }
 
-fn token_balance(deps: Deps, address: Addr) -> StdResult<Binary> {
-    let token_manager = BANK
-        .may_load(deps.storage, address.as_str().as_bytes())?
-        .unwrap_or_default();
+// Limits for pagination
+const MAX_LIMIT: u32 = 30;
+const DEFAULT_LIMIT: u32 = 10;
 
-    let resp = TokenStakeResponse {
-        token_balance: token_manager.token_balance,
+fn query_list(deps: Deps, start_after: Option<u64>, limit: Option<u32>) -> StdResult<ListResponse> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
+    let start = start_after.map(Bound::exclusive);
+    let entries: StdResult<Vec<_>> = LIST
+        .range(deps.storage, start, None, Order::Ascending)
+        .take(limit)
+        .collect();
+
+    let result = ListResponse {
+        entries: entries?.into_iter().map(|l| l.1).collect(),
     };
+    Ok(result)
+}
 
-    to_binary(&resp)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
+    use cosmwasm_std::{attr, from_binary, Addr};
+    use std::vec::Vec;
+
+    #[test]
+    fn proper_initialization() {
+        let mut deps = mock_dependencies();
+        //no owner specified in the instantiation message
+        let msg = InstantiateMsg { owner: None };
+        let env = mock_env();
+        let info = mock_info("creator", &[]);
+
+        let res = instantiate(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(0, res.messages.len());
+
+        // it worked, let's query the state
+        let state = CONFIG.load(&deps.storage).unwrap();
+        assert_eq!(
+            state,
+            Config {
+                owner: Addr::unchecked("creator".to_string()),
+            }
+        );
+        //specifying an owner address in the instantiation message
+        let msg = InstantiateMsg {
+            owner: Some("specified_owner".to_string()),
+        };
+
+        let res = instantiate(deps.as_mut(), env, info, msg).unwrap();
+        assert_eq!(0, res.messages.len());
+
+        // it worked, let's query the state
+        let state = CONFIG.load(&deps.storage).unwrap();
+        assert_eq!(
+            state,
+            Config {
+                owner: Addr::unchecked("specified_owner".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn create_update_delete_entry() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+        let info = mock_info("creator", &[]);
+        let msg = InstantiateMsg { owner: None };
+
+        let res = instantiate(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(0, res.messages.len());
+
+        let msg = ExecuteMsg::NewEntry {
+            description: "A new entry.".to_string(),
+            priority: Some(Priority::Medium),
+        };
+
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(
+            res.attributes,
+            vec![
+                attr("method", "execute_create_new_entry"),
+                attr("new_entry_id", "1")
+            ]
+        );
+        // Query single entry
+        let res = query(deps.as_ref(), env.clone(), QueryMsg::QueryEntry { id: 1 }).unwrap();
+        let entry: EntryResponse = from_binary(&res).unwrap();
+        assert_eq!(
+            EntryResponse {
+                id: 1,
+                description: "A new entry.".to_string(),
+                status: Status::ToDo,
+                priority: Priority::Medium
+            },
+            entry
+        );
+
+        let msg = ExecuteMsg::NewEntry {
+            description: "Another entry.".to_string(),
+            priority: Some(Priority::High),
+        };
+
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(
+            res.attributes,
+            vec![
+                attr("method", "execute_create_new_entry"),
+                attr("new_entry_id", "2")
+            ]
+        );
+
+        // Query the list of entries
+        let res = query(
+            deps.as_ref(),
+            env.clone(),
+            QueryMsg::QueryList {
+                start_after: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        let list: ListResponse = from_binary(&res).unwrap();
+        assert_eq!(
+            Vec::from([
+                Entry {
+                    id: 1,
+                    description: "A new entry.".to_string(),
+                    status: Status::ToDo,
+                    priority: Priority::Medium
+                },
+                Entry {
+                    id: 2,
+                    description: "Another entry.".to_string(),
+                    status: Status::ToDo,
+                    priority: Priority::High
+                }
+            ]),
+            list.entries
+        );
+
+        // Update entry
+        let message = ExecuteMsg::UpdateEntry {
+            id: 1,
+            description: Some("Updated entry.".to_string()),
+            status: Some(Status::InProgress),
+            priority: Some(Priority::Low),
+        };
+
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), message).unwrap();
+        assert_eq!(
+            res.attributes,
+            vec![
+                attr("method", "execute_update_entry"),
+                attr("updated_entry_id", "1")
+            ]
+        );
+
+        // Query single entry
+        let res = query(deps.as_ref(), env.clone(), QueryMsg::QueryEntry { id: 1 }).unwrap();
+        let entry: EntryResponse = from_binary(&res).unwrap();
+        assert_eq!(
+            EntryResponse {
+                id: 1,
+                description: "Updated entry.".to_string(),
+                status: Status::InProgress,
+                priority: Priority::Low
+            },
+            entry
+        );
+
+        // Query the list of entries
+        let res = query(
+            deps.as_ref(),
+            env.clone(),
+            QueryMsg::QueryList {
+                start_after: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        let list: ListResponse = from_binary(&res).unwrap();
+        assert_eq!(
+            Vec::from([
+                Entry {
+                    id: 1,
+                    description: "Updated entry.".to_string(),
+                    status: Status::InProgress,
+                    priority: Priority::Low
+                },
+                Entry {
+                    id: 2,
+                    description: "Another entry.".to_string(),
+                    status: Status::ToDo,
+                    priority: Priority::High
+                }
+            ]),
+            list.entries
+        );
+
+        //Delete Entry
+        let message = ExecuteMsg::DeleteEntry { id: 1 };
+
+        let res = execute(deps.as_mut(), env.clone(), info, message).unwrap();
+        assert_eq!(
+            res.attributes,
+            vec![
+                attr("method", "execute_delete_entry"),
+                attr("deleted_entry_id", "1")
+            ]
+        );
+        // Query the list of entries
+        let res = query(
+            deps.as_ref(),
+            env,
+            QueryMsg::QueryList {
+                start_after: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        let list: ListResponse = from_binary(&res).unwrap();
+        assert_eq!(
+            Vec::from([Entry {
+                id: 2,
+                description: "Another entry.".to_string(),
+                status: Status::ToDo,
+                priority: Priority::High
+            }]),
+            list.entries
+        );
+    }
 }
